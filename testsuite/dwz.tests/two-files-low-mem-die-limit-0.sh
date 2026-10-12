@@ -5,9 +5,10 @@ $execs/dwz-for-test \
     -l0 \
     --devel-trace \
     1 2 \
+    -j 1 \
     2> dwz.err
 
-if egrep -q "Compressing (1|2)$" dwz.err; then
+if grep -Eq "Compressing (1|2)$" dwz.err; then
     exit 1
 fi
 

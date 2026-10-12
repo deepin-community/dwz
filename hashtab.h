@@ -153,11 +153,6 @@ extern void	htab_restore (htab_t, const char *, htab_restorefn);
 
 #endif
 
-/* An iterative hash function for arbitrary data.  */
-extern hashval_t iterative_hash (const void *, size_t, hashval_t);
-/* Shorthand for hashing something with an intrinsic size.  */
-#define iterative_hash_object(OB,INIT) iterative_hash (&OB, sizeof (OB), INIT)
-
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */

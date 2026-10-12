@@ -22,7 +22,6 @@
 #include <errno.h>
 #include <error.h>
 #include <fcntl.h>
-#include <getopt.h>
 #include <setjmp.h>
 #include <string.h>
 #include <stdbool.h>
@@ -35,13 +34,19 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/times.h>
+#include <sys/wait.h>
 
 #include <obstack.h>
 
 #include <gelf.h>
+#include <xxhash.h>
+
 #include "dwarf2.h"
 #include "hashtab.h"
 #include "sha1.h"
+#include "args.h"
+#include "util.h"
+#include "pool.h"
 
 #ifndef SHF_COMPRESSED
  /* Glibc elf.h contains SHF_COMPRESSED starting v2.22.  Libelf libelf.h has
@@ -109,29 +114,41 @@
 # define NT_GNU_BUILD_ID 3
 #endif
 
-#if defined __GNUC__ && __GNUC__ >= 3
-# define likely(x) __builtin_expect (!!(x), 1)
-# define unlikely(x) __builtin_expect (!!(x), 0)
-#else
-# define likely(x) (x)
-# define unlikely(x) (x)
-#endif
+/* xxHash state object.  Init in main.  */
+static XXH64_state_t *state;
 
-#if defined __GNUC__
-# define FORCE_INLINE __attribute__((always_inline))
-# define UNUSED __attribute__((unused))
-# define USED __attribute__((used))
-#else
-# define FORCE_INLINE
-# define UNUSED
-# define USED
-#endif
+/* Clear xxHash state to zero.  */
+#define hash_init_state() XXH64_reset(state, 0)
 
-/* Utility macro.  */
-#define IMPLIES(A, B) (!((A) && !(B)))
-#define MAX(A, B) ((A) > (B) ? (A) : (B))
-#define MIN(A, B) ((A) < (B) ? (A) : (B))
+/* Update hash STATE with VALUE.  */
+#define hash_update_state_object(value) XXH64_update(state, &value, sizeof value)
 
+/* Update hash STATE with OBJECT that has a provided SIZE.  */
+#define hash_update_state(object, size) XXH64_update(state, object, size)
+
+/* Get digest once we are done with a state.  */
+#define hash_digest() XXH64_digest(state)
+
+/* Shorthand for hashing something with an intrinsic size.  */
+#define hash(IN,LEN) XXH64(IN, LEN, 0)
+#define iterative_hash(IN,LEN,INIT) XXH64(IN, LEN, INIT)
+#define iterative_hash_object(OB,INIT) iterative_hash (&OB, sizeof (OB), INIT)
+
+/* Print memory amount M (in kb) in both exact and human readable, like so:
+   1382508 (1.3G).  */
+static void
+print_mem (long m)
+{
+  float h = m;
+  int level = 0;
+  const char *unit[] = { "K", "M", "G"};
+  while (h > 1024 && level <= 2)
+    {
+      h = h / 1024;
+      level++;
+    }
+  fprintf (stderr, "%ld (%.1f%s)\n", m, h, unit[level]);
+}
 
 static void
 report_progress (void)
@@ -157,6 +174,40 @@ report_progress (void)
   clock_t sys = current.tms_stime - prev.tms_stime;
   fprintf (stderr, "user: %.2f\n", (float)user / (float)ticks_per_second);
   fprintf (stderr, "sys : %.2f\n", (float)sys / (float)ticks_per_second);
+
+  if (progress_mem_p)
+    {
+      FILE *s = fopen ("/proc/self/status", "r");
+      char *p;
+      bool print_next = false;
+      for (p = NULL; fscanf (s, "%ms", &p) && p != NULL; free (p))
+	{
+	  if (print_next)
+	    {
+	      long mem = strtol (p, NULL, 10);
+	      print_mem (mem);
+	      print_next = false;
+	      continue;
+	    }
+
+	  if (!(p[0] == 'V' && p[1] == 'm'))
+	    continue;
+
+	  if (strcmp (&p[2], "Peak:") == 0)
+	    fprintf (stderr, "VM Peak: ");
+	  else if (strcmp (&p[2], "Size:") == 0)
+	    fprintf (stderr, "VM Current: ");
+	  else if (strcmp (&p[2], "HWM:") == 0)
+	    fprintf (stderr, "RSS Peak: ");
+	  else if (strcmp (&p[2], "RSS:") == 0)
+	    fprintf (stderr, "RSS Current: ");
+	  else
+	    continue;
+
+	  print_next = true;
+	}
+      fclose (s);
+    }
 }
 
 #define obstack_chunk_alloc     malloc
@@ -168,7 +219,7 @@ static jmp_buf oom_buf;
 /* Handle OOM situation.  If handling more than one file, we might
    just fail to handle some large file due to OOM, but could very well
    handle other smaller files after it.  */
-static void
+void
 dwz_oom (void)
 {
   longjmp (oom_buf, 1);
@@ -184,57 +235,7 @@ static struct obstack ob2;
    and restored during final cleanup.  */
 static struct obstack alt_ob, alt_ob2;
 
-#if DEVEL
-static int tracing;
-static int ignore_size;
-static int ignore_locus;
-static int dump_checksum_p;
-static int dump_dies_p;
-static int dump_dups_p;
-static int dump_pus_p;
-static int verify_dups_p;
-static int verify_edge_freelist;
-static int stats_p;
-#else
-#define tracing 0
-#define ignore_size 0
-#define ignore_locus 0
-#define dump_checksum_p 0
-#define dump_dies_p 0
-#define dump_dups_p 0
-#define dump_pus_p 0
-#define verify_dups_p 0
-#define stats_p 0
-#endif
-static int unoptimized_multifile;
-static int save_temps = 0;
-static int verify_edges_p = 0;
-static int dump_edges_p = 0;
-static int partition_dups_opt;
-static int progress_p;
-static int import_opt_p = 1;
-static int force_p = 0;
-enum deduplication_mode
-{
-  dm_none,
-  dm_intra_cu,
-  dm_inter_cu
-};
-static enum deduplication_mode deduplication_mode = dm_inter_cu;
-static int uni_lang_p = 0;
-static int gen_cu_p = 0;
-enum die_count_methods
-{
-  none,
-  estimate
-};
-static enum die_count_methods die_count_method = estimate;
-
-int odr = 0;
-enum odr_mode { ODR_BASIC, ODR_LINK };
-enum odr_mode odr_mode = ODR_LINK;
-int odr_mode_parsed = 0;
-bool odr_active_p = false;
+static bool odr_active_p = false;
 
 /* Struct to gather statistics.  */
 struct stats
@@ -253,7 +254,7 @@ struct stats
   unsigned int pu_ph2_cnt;
   unsigned int pu_toplevel_die_cnt;
 };
-struct stats *stats;
+static struct stats *stats;
 
 /* Initialize stats struct.  */
 static void
@@ -517,13 +518,15 @@ buf_read_ube16 (unsigned char *data)
 static inline uint32_t
 buf_read_ule32 (unsigned char *data)
 {
-  return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+  return (data[0] | (data[1] << 8) | (data[2] << 16)
+	  | ((unsigned int)data[3] << 24));
 }
 
 static inline uint32_t
 buf_read_ube32 (unsigned char *data)
 {
-  return data[3] | (data[2] << 8) | (data[1] << 16) | (data[0] << 24);
+  return (data[3] | (data[2] << 8) | (data[1] << 16)
+	  | ((unsigned int)data[0] << 24));
 }
 
 static inline uint64_t
@@ -828,18 +831,6 @@ static int multi_endian;
 /* Highest .gdb_index version seen.  */
 static unsigned int multi_gdb_index_ver;
 
-/* Number of DIEs, above which dwz retries processing
-   in low_mem mode (and give up on multifile optimizing
-   the file in question).  */
-static unsigned int low_mem_die_limit = 10000000;
-
-/* Number of DIEs, above which dwz gives up processing
-   input altogether.  */
-static unsigned int max_die_limit = 50000000;
-
-/* Phase of multifile handling.  */
-static unsigned char multifile_mode;
-
 enum multifile_mode_kind
 {
   MULTIFILE_MODE_WR = 1,
@@ -864,28 +855,8 @@ enum multifile_mode_kind
 /* True if running in low_mem mode.  */
 #define low_mem (multifile_mode & MULTIFILE_MODE_LOW_MEM)
 
-/* Filename if inter-file size optimization should be performed.  */
-static const char *multifile;
-
-/* Argument of -M option, i.e. preferred name that should be stored
-   into the .gnu_debugaltlink or .debug_sup section.  */
-static const char *multifile_name;
-
-/* True if -r option is present, i.e. .gnu_debugaltlink or .debug_sup section
-   should contain a filename relative to the directory in which
-   the particular file is present.  */
-static bool multifile_relative;
-
 /* SHA1 checksum (build-id) of the common file.  */
 static unsigned char multifile_sha1[0x14];
-
-/* True if DWARF 5 .debug_sup and DW_FORM_ref_sup4 / DW_FORM_strp_sup
-   should be used instead of the GNU extensions .gnu_debugaltlink
-   and DW_FORM_GNU_ref_alt / DW_FORM_GNU_strp_alt etc.  */
-static bool dwarf_5;
-
-/* True if -q option has been passed.  */
-static bool quiet;
 
 /* A single attribute in abbreviations.  */
 struct abbrev_attr
@@ -1151,78 +1122,16 @@ die_cu (dw_die_ref die)
 #define die_safe_nextdup(die) \
   ((die)->die_toplevel ? (die)->die_nextdup : (dw_die_ref) NULL)
 
-#ifdef __GNUC__
-# define ALIGN_STRUCT(name)
-#else
-# define ALIGN_STRUCT(name) struct align_##name { char c; struct name s; };
-#endif
 ALIGN_STRUCT (abbrev_tag)
 ALIGN_STRUCT (dw_file)
 ALIGN_STRUCT (dw_cu)
 ALIGN_STRUCT (dw_die)
 
-/* Big pool allocator.  obstack isn't efficient, because it aligns everything
-   too much, and allocates too small chunks.  All these objects are only freed
-   together.  */
-
-/* Pointer to the start of the current pool chunk, current first free byte
-   in the chunk and byte after the end of the current pool chunk.  */
-static unsigned char *pool, *pool_next, *pool_limit;
 
 /* After read_multifile, pool variable is moved over to this variable
    as the pool from read_multifile needs to be around for subsequent dwz
    calls.  Freed only during the final cleanup at the very end.  */
 static unsigned char *alt_pool;
-
-/* Allocate SIZE bytes with ALIGN bytes alignment from the pool.  */
-static void *
-pool_alloc_1 (unsigned int align, unsigned int size)
-{
-  void *ret;
-  if (pool == NULL
-      || (size_t) (pool_limit - pool_next) < (size_t) align + size)
-    {
-      size_t new_size = (size_t) align + size;
-      unsigned char *new_pool;
-      new_size += sizeof (void *);
-      if (new_size < 16384 * 1024 - 64)
-	new_size = 16384 * 1024 - 64;
-      new_pool = (unsigned char *) malloc (new_size);
-      if (new_pool == NULL)
-	dwz_oom ();
-      *(unsigned char **) new_pool = pool;
-      pool_next = new_pool + sizeof (unsigned char *);
-      pool_limit = new_pool + new_size;
-      pool = new_pool;
-    }
-  pool_next = (unsigned char *) (((uintptr_t) pool_next + align - 1)
-				 & ~(uintptr_t) (align - 1));
-  ret = pool_next;
-  pool_next += size;
-  return ret;
-}
-
-/* Free the whole pool.  */
-static void
-pool_destroy (void)
-{
-  pool_next = NULL;
-  pool_limit = NULL;
-  while (pool)
-    {
-      void *p = (void *) pool;
-      pool = *(unsigned char **) pool;
-      free (p);
-    }
-}
-
-#ifdef __GNUC__
-# define pool_alloc(name, size) \
-  (struct name *) pool_alloc_1 (__alignof__ (struct name), size)
-#else
-# define pool_alloc(name, size) \
-  (struct name *) pool_alloc_1 (offsetof (struct align_##name, s), size)
-#endif
 
 static struct abbrev_tag *
 pool_clone_abbrev (struct abbrev_tag *t)
@@ -1300,16 +1209,18 @@ compute_abbrev_hash (struct abbrev_tag *t)
 {
   unsigned int i;
 
-  t->hash = iterative_hash_object (t->tag, 0);
-  t->hash = iterative_hash_object (t->nattr, t->hash);
-  t->hash = iterative_hash_object (t->children, t->hash);
+  hash_init_state ();
+  hash_update_state_object (t->tag);
+  hash_update_state_object (t->nattr);
+  hash_update_state_object (t->children);
   for (i = 0; i < t->nattr; i++)
     {
-      t->hash = iterative_hash_object (t->attr[i].attr, t->hash);
-      t->hash = iterative_hash_object (t->attr[i].form, t->hash);
+      hash_update_state_object (t->attr[i].attr);
+      hash_update_state_object (t->attr[i].form);
       if (t->attr[i].form == DW_FORM_implicit_const)
-	t->hash = iterative_hash_object (t->values[i], t->hash);
+	hash_update_state_object (t->values[i]);
     }
+  t->hash = hash_digest ();
 }
 
 /* Maximum number of attributes in a DIE.  */
@@ -1351,8 +1262,9 @@ read_abbrev (DSO *dso, unsigned char *ptr)
 		       || form == DW_FORM_data16
 		       || form == DW_FORM_line_strp)))
 	    {
-	      error (0, 0, "%s: Unknown DWARF %s",
-		     dso->filename, get_DW_FORM_str (form));
+	      error (0, 0, "%s: Unknown DWARF %s at .debug_abbrev [%zd]",
+		     dso->filename, get_DW_FORM_str (form),
+		     p - debug_sections[DEBUG_ABBREV].data);
 	      htab_delete (h);
 	      return NULL;
 	    }
@@ -1882,7 +1794,7 @@ read_debug_line (DSO *dso, dw_cu_ref cu, uint32_t off)
 		    {
 		    case DW_FORM_string:
 		      f = (char *) ptr;
-		      end = strchr ((char *)ptr, 0) + 1;;
+		      end = strchr ((char *)ptr, 0) + 1;
 		      break;
 		    case DW_FORM_strp:
 		      {
@@ -1992,7 +1904,7 @@ read_debug_line (DSO *dso, dw_cu_ref cu, uint32_t off)
 
 /* Estimate the amount of DIEs in the .debug_info section, based on the size
    of that section.  */
-static unsigned int UNUSED
+static unsigned int
 estimate_nr_dies (void)
 {
   unsigned int average_die_size = 11;
@@ -2000,7 +1912,7 @@ estimate_nr_dies (void)
   return nr_dies;
 }
 
-static size_t UNUSED
+static size_t
 emulate_htab (size_t initial, size_t final_nr_elements)
 {
   size_t size = initial;
@@ -2574,8 +2486,10 @@ read_exprloc (DSO *dso, dw_die_ref die, unsigned char *ptr, size_t len,
 	    *need_adjust = true;
 	  break;
 	default:
-	  error (0, 0, "%s: Unknown DWARF %s",
-		 dso->filename, get_DW_OP_str (op));
+	  error (0, 0, "%s: Unknown DWARF %s "
+		 "referenced from DIE at [%x]",
+		 dso->filename, get_DW_OP_str (op),
+		 die->die_offset);
 	  return 1;
 	}
     }
@@ -2776,8 +2690,10 @@ read_exprloc_low_mem_phase1 (DSO *dso, dw_die_ref die, unsigned char *ptr,
 	  skip_leb128 (ptr);
 	  break;
 	default:
-	  error (0, 0, "%s: Unknown DWARF %s",
-		 dso->filename, get_DW_OP_str (op));
+	  error (0, 0, "%s: Unknown DWARF %s "
+		 "referenced from DIE at [%x]",
+		 dso->filename, get_DW_OP_str (op),
+		 die->die_offset);
 	  return 1;
 	}
     }
@@ -3310,7 +3226,7 @@ set_die_odr_state (dw_cu_ref cu, dw_die_ref die)
 }
 
 /* Return the initialized die_odr_state field for DIE with CU.  */
-static unsigned int UNUSED
+static unsigned int
 die_odr_state (dw_die_ref die)
 {
   assert (die->die_odr_state != ODR_UNKNOWN);
@@ -3391,6 +3307,7 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
       size_t len = 0;
       unsigned char *old_ptr;
       bool handled = false;
+      int64_t svalue;
       uint64_t value;
 
       while (form == DW_FORM_indirect)
@@ -3464,7 +3381,7 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
 	      value = read_uleb128 (ptr); handled = true; break;
 	    case DW_FORM_sdata:
 	      {
-		int64_t svalue = read_sleb128 (ptr);
+		svalue = read_sleb128 (ptr);
 		if (svalue >= 0)
 		  {
 		    value = svalue;
@@ -3482,9 +3399,10 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
 	      }
 	    case DW_FORM_implicit_const:
 	      {
-		if (t->values[i] >= 0)
+		svalue = t->values[i];
+		if (svalue >= 0)
 		  {
-		    value = t->values[i];
+		    value = svalue;
 		    handled = true;
 		    break;
 		  }
@@ -3515,22 +3433,17 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
 		  struct dw_file *cu_file = &cu->cu_files[value - 1];
 		  size_t file_len = strlen (cu_file->file);
 		  s = t->attr[i].attr;
-		  die->u.p1.die_hash
-		    = iterative_hash_object (s, die->u.p1.die_hash);
-		  die->u.p1.die_hash
-		    = iterative_hash_object (cu_file->time,
-					     die->u.p1.die_hash);
-		  die->u.p1.die_hash
-		    = iterative_hash_object (cu_file->size,
-					     die->u.p1.die_hash);
-		  die->u.p1.die_hash
-		    = iterative_hash (cu_file->file, file_len + 1,
-				      die->u.p1.die_hash);
+		  hash_init_state ();
+		  hash_update_state_object (die->u.p1.die_hash);
+		  hash_update_state_object (s);
+		  hash_update_state_object (cu_file->time);
+		  hash_update_state_object (cu_file->size);
+		  hash_update_state (cu_file->file, file_len + 1);
 		  if (cu_file->dir)
-		    die->u.p1.die_hash
-		      = iterative_hash (cu_file->dir,
-					strlen (cu_file->dir) + 1,
-					die->u.p1.die_hash);
+		    {
+		      hash_update_state (cu_file->dir,
+						strlen (cu_file->dir) + 1);
+		    }
 		  /* Ignore DW_AT_comp_dir for DW_AT_*_file <built-in>
 		     etc. if immediately followed by DW_AT_*_line 0.  */
 		  else if (cu_file->file_angle_brackets_encapsulated_no_slash
@@ -3540,7 +3453,13 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
 				  ? DW_AT_decl_line : DW_AT_call_line)
 			   && t->attr[i + 1].form == DW_FORM_data1
 			   && *new_ptr == 0)
-		    break;
+		    {
+		      die->u.p1.die_hash = hash_digest ();
+		      break;
+		    }
+
+		  die->u.p1.die_hash = hash_digest ();
+
 		  if (cu->cu_comp_dir
 		      && (cu_file->dir ? cu_file->dir[0]
 				       : cu_file->file[0]) != '/')
@@ -3570,7 +3489,7 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
 	      value = read_uleb128 (ptr); handled = true; break;
 	    case DW_FORM_sdata:
 	      {
-		int64_t svalue = read_sleb128 (ptr);
+		svalue = read_sleb128 (ptr);
 		if (svalue >= 0)
 		  {
 		    value = svalue;
@@ -3581,9 +3500,10 @@ checksum_die (DSO *dso, dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die)
 		  goto negative;
 	      }
 	    case DW_FORM_implicit_const:
-	      if (t->values[i] >= 0)
+	      svalue = t->values[i];
+	      if (svalue >= 0)
 		{
-		  value = t->values[i];
+		  value = svalue;
 		  handled = true;
 		  break;
 		}
@@ -4380,7 +4300,7 @@ checksum_ref_die (dw_cu_ref cu, dw_die_ref top_die, dw_die_ref die,
 		    }
 		}
 	    }
-	  if (minidx != -1U)
+	  if (checksum_cycle_opt && minidx != -1U)
 	    {
 	      idx = 0;
 	      checksum_ref_die (die_cu (arr[minidx]), arr[minidx],
@@ -5544,7 +5464,7 @@ dump_die_with_indent (int indent, dw_die_ref die)
 }
 
 /* Dump DIE to stderr.  */
-void USED
+static void
 dump_die (dw_die_ref die)
 {
   dump_die_with_indent (0, die);
@@ -5654,7 +5574,7 @@ strp_eq2 (const void *p, const void *q)
 static hashval_t
 strp_hash3 (const void *p)
 {
-  return iterative_hash (p, strlen (p), 0);
+  return hash (p, strlen (p));
 }
 
 /* Corresponding equality function in strp_htab.  */
@@ -5684,7 +5604,7 @@ note_strp_offset (unsigned int off)
 
       p = debug_sections[DEBUG_STR].data + off;
       len = strlen ((char *) p);
-      hash = iterative_hash (p, len, 0);
+      hash = hash (p, len);
       if (alt_strp_htab)
 	{
 	  if (htab_find_with_hash (alt_strp_htab, p, hash))
@@ -5766,7 +5686,7 @@ lookup_strp_offset (unsigned int off)
 
       p = debug_sections[DEBUG_STR].data + off;
       len = strlen ((char *) p);
-      hash = iterative_hash (p, len, 0);
+      hash = hash (p, len);
       if (alt_strp_htab)
 	{
 	  unsigned char *q = (unsigned char *)
@@ -5807,7 +5727,7 @@ note_strp_offset2 (unsigned int off)
 	{
 	  p = debug_sections[DEBUG_STR].data + off;
 	  len = strlen ((char *) p);
-	  hash = iterative_hash (p, len, 0);
+	  hash = hash (p, len);
 	  if (htab_find_with_hash (alt_strp_htab, p, hash))
 	    return dwarf_5 ? DW_FORM_strp_sup : DW_FORM_GNU_strp_alt;
 	}
@@ -5817,7 +5737,7 @@ note_strp_offset2 (unsigned int off)
     return DW_FORM_strp;
   p = debug_sections[DEBUG_STR].data + off;
   q = (unsigned char *) strchr ((char *) p, '\0');
-  hash = iterative_hash (p, q - p, 0);
+  hash = hash (p, q - p);
   se.off = off;
   se.new_off = hash & ~1U;
   struct strp_entry *s = (struct strp_entry *)
@@ -5973,7 +5893,7 @@ finalize_strp (bool build_tail_offset_list)
 
 	memcpy (p, debug_sections[DEBUG_STR].data + arr[i]->off, len);
 	slot = htab_find_slot_with_hash (strp_htab, p,
-					 iterative_hash (p, len - 1, 0),
+					 hash (p, len - 1),
 					 INSERT);
 	if (slot == NULL)
 	  dwz_oom ();
@@ -5989,7 +5909,7 @@ finalize_strp (bool build_tail_offset_list)
 	      if (tail_offset_list != NULL)
 		tail_offset_list[k++] = arr[j]->new_off;
 	      slot = htab_find_slot_with_hash (strp_htab, q,
-					       iterative_hash (q, l - 1, 0),
+					       hash (q, l - 1),
 					       INSERT);
 	      if (slot == NULL)
 		dwz_oom ();
@@ -6659,7 +6579,8 @@ read_debug_info (DSO *dso, int kind, unsigned int *die_count)
       if (dup_htab == NULL)
 	dwz_oom ();
     }
-  if (unlikely (op_multifile || rd_multifile || fi_multifile || low_mem))
+  if (unlikely (meta_abbrev_htab == NULL
+		&& (op_multifile || rd_multifile || fi_multifile || low_mem)))
     {
       meta_abbrev_htab
 	= htab_try_create (500, meta_abbrev_hash, meta_abbrev_eq,
@@ -7179,15 +7100,16 @@ read_debug_info (DSO *dso, int kind, unsigned int *die_count)
 		case DW_FORM_block:
 		  abort ();
 		default:
-		  error (0, 0, "%s: Unknown DWARF %s",
-			 dso->filename, get_DW_FORM_str (form));
+		  error (0, 0, "%s: Unknown DWARF %s at DIE [%x]",
+			 dso->filename, get_DW_FORM_str (form), die_offset);
 		  goto fail;
 		}
 
 	      if (ptr > endcu)
 		{
-		  error (0, 0, "%s: Attributes extend beyond end of CU",
-			 dso->filename);
+		  error (0, 0, "%s: Attributes extend beyond end of CU "
+			 "for DIE [%x]",
+			 dso->filename, die_offset);
 		  goto fail;
 		}
 
@@ -7195,8 +7117,9 @@ read_debug_info (DSO *dso, int kind, unsigned int *die_count)
 		{
 		  if (len >= (size_t) (endcu - ptr))
 		    {
-		      error (0, 0, "%s: Attributes extend beyond end of CU",
-			     dso->filename);
+		      error (0, 0, "%s: Attributes extend beyond end of CU "
+			     "for DIE [%x]",
+			     dso->filename, die_offset);
 		      goto fail;
 		    }
 
@@ -7210,8 +7133,9 @@ read_debug_info (DSO *dso, int kind, unsigned int *die_count)
 			     > DW_AT_GNU_call_site_target_clobbered))
 		    {
 		      error (0, 0, "%s: Unknown DWARF %s with "
-				   "block DW_FORM",
-			     dso->filename, get_DW_AT_str (t->attr[i].attr));
+				   "block DW_FORM for DIE [%x]",
+			     dso->filename, get_DW_AT_str (t->attr[i].attr),
+			     die_offset);
 		      goto fail;
 		    }
 
@@ -7265,6 +7189,12 @@ read_debug_info (DSO *dso, int kind, unsigned int *die_count)
 	}
 
       cu->cu_comp_dir = get_AT_string (cu->cu_die, DW_AT_comp_dir);
+      if (skip_producers_p
+	  && skip_producer (get_AT_string (cu->cu_die, DW_AT_producer)))
+	{
+	  cu->cu_die->die_remove = 1;
+	  continue;
+	}
       enum dwarf_form form;
       debug_line_off
 	= get_AT_int (cu->cu_die, DW_AT_stmt_list, &present, &form);
@@ -8195,12 +8125,13 @@ partition_dups_1 (dw_die_ref *arr, size_t nr_partitions, size_t *partitions,
 	      else
 		stats->pu_ph2_cnt++;
 	    }
-	  if (dump_pus_p)
-	    fprintf (stderr, "Partial unit (%s):\n",
-		     second_phase ? "phase two" : "phase one");
 	  partial_cu->cu_kind = CU_PU;
 	  partial_cu->cu_offset = *last_partial_cu == NULL
 				  ? 0 : (*last_partial_cu)->cu_offset + 1;
+	  if (dump_pus_p)
+	    fprintf (stderr, "Partial unit (%s) @ 0x%x:\n",
+		     second_phase ? "phase two" : "phase one",
+		     partial_cu->cu_offset);
 	  partial_cu->cu_version = refcu->cu_version;
 	  if (uni_lang_p)
 	    partial_cu->lang = refcu->lang;
@@ -8378,7 +8309,12 @@ merged_singleton (dw_die_ref die)
       {
       case ODR_DEF:
 	if (res)
-	  return NULL;
+	  {
+	    if (die_cu (res) == die_cu (d))
+	      continue;
+	    else
+	      return NULL;
+	  }
 	else
 	  res = d;
 	break;
@@ -8904,7 +8840,7 @@ verify_edges_1 (struct import_cu *ipu, unsigned int *ic, unsigned int *oc,
 
 /* Helper function for debugging create_import_tree.  Call verify_edges_1
    on all CUs and PUs.  */
-void
+static void
 verify_edges (struct import_cu **ipus, unsigned int npus, unsigned int ncus,
 	      unsigned int phase)
 {
@@ -8976,7 +8912,7 @@ bitvector_set_bit (BITVECTOR_TYPE *vector, unsigned idx)
 {
   unsigned div = idx / (sizeof (BITVECTOR_TYPE) * 8);
   unsigned mod = idx % (sizeof (BITVECTOR_TYPE) * 8);
-  vector[div] |= (1 << mod);
+  vector[div] |= (1U << mod);
 }
 
 /* Test bit IDX in bitvector VECTOR.  */
@@ -8985,7 +8921,7 @@ bitvector_bit_p (BITVECTOR_TYPE *vector, unsigned idx)
 {
   unsigned div = idx / (sizeof (BITVECTOR_TYPE) * 8);
   unsigned mod = idx % (sizeof (BITVECTOR_TYPE) * 8);
-  return (vector[div] & (1 << mod)) != 0;
+  return (vector[div] & (1U << mod)) != 0;
 }
 
 /* Clear at least bits [A, B] in VECTOR, possibly more.  */
@@ -9075,11 +9011,18 @@ create_import_tree (void)
       ipu->cu = pu;
       pu->u1.cu_icu = ipu;
       assert (rdie->die_toplevel);
+      dw_die_ref firstdie = NULL;
+      dw_cu_ref firstdiecu = NULL;
       for (die = rdie->die_nextdup, prev_cu = NULL;
 	   die; die = die->die_nextdup)
 	{
 	  dw_cu_ref diecu = die_cu (die);
-	  if (diecu == prev_cu)
+	  if (firstdie == NULL)
+	    {
+	      firstdie = die;
+	      firstdiecu = die_cu (firstdie);
+	    }
+	  if (diecu == prev_cu || (die != firstdie && diecu == firstdiecu))
 	    continue;
 	  ipu->incoming_count++;
 	  size += 1 + (diecu->cu_version == 2 ? ptr_size : 4);
@@ -9089,11 +9032,18 @@ create_import_tree (void)
 		       obstack_alloc (&ob2,
 				      ipu->incoming_count
 				      * sizeof (*ipu->incoming));
+      firstdie = NULL;
+      firstdiecu = NULL;
       for (die = rdie->die_nextdup, i = 0, prev_cu = NULL;
 	   die; die = die->die_nextdup)
 	{
 	  dw_cu_ref diecu = die_cu (die);
-	  if (diecu == prev_cu)
+	  if (firstdie == NULL)
+	    {
+	      firstdie = die;
+	      firstdiecu = die_cu (firstdie);
+	    }
+	  if (diecu == prev_cu || (die != firstdie && diecu == firstdiecu))
 	    continue;
 	  icu = diecu->u1.cu_icu;
 	  if (icu == NULL)
@@ -9935,17 +9885,16 @@ line_htab_lookup (dw_cu_ref cu, unsigned int id)
 {
   void **slot;
   struct line_entry le;
-  hashval_t h;
-
   if (id == 0)
     return 0;
   assert (id <= cu->cu_nfiles);
   le.file = &cu->cu_files[id - 1];
-  h = iterative_hash_object (le.file->time, 0);
-  h = iterative_hash_object (le.file->size, h);
-  h = iterative_hash (le.file->file, strlen (le.file->file) + 1, h);
+  hash_init_state ();
+  hash_update_state_object (le.file->time);
+  hash_update_state_object (le.file->size);
+  hash_update_state (le.file->file, strlen (le.file->file) + 1);
   if (le.file->dir)
-    h = iterative_hash (le.file->dir, strlen (le.file->dir) + 1, h);
+    hash_update_state (le.file->dir, strlen (le.file->dir) + 1);
   if (line_htab == NULL)
     {
       line_htab = htab_try_create (50, line_hash, line_eq, NULL);
@@ -9953,15 +9902,15 @@ line_htab_lookup (dw_cu_ref cu, unsigned int id)
 	dwz_oom ();
       max_line_id = 1;
     }
-  le.hash = h;
-  slot = htab_find_slot_with_hash (line_htab, &le, h, INSERT);
+  le.hash = hash_digest ();
+  slot = htab_find_slot_with_hash (line_htab, &le, le.hash, INSERT);
   if (slot == NULL)
     dwz_oom ();
   if (*slot == NULL)
     {
       struct line_entry *l = pool_alloc (line_entry, sizeof (*l));
       l->file = le.file;
-      l->hash = h;
+      l->hash = le.hash;
       l->new_id = max_line_id++;
       *slot = (void *) l;
       return l->new_id;
@@ -10433,7 +10382,7 @@ handle_macro (void)
 		  /* This should only happen if there were multiple
 		     same transparent units within a single object file.  */
 		  && htab_find_with_hash (strp_htab, p,
-					  iterative_hash (p, len, 0)) == NULL)
+					  hash (p, len)) == NULL)
 		can_share = false;
 	      s = ptr;
 	      break;
@@ -11238,7 +11187,10 @@ build_abbrevs (dw_cu_ref cu, struct abbrev_tag *t, unsigned int *ndies,
 
   if (build_abbrevs_for_die (h, cu, cu->cu_die, NULL, NULL, t, ndies, vec,
 			     false))
-    return 1;
+    {
+      htab_delete (h);
+      return 1;
+    }
 
   cu->cu_new_abbrev = h;
   return 0;
@@ -14443,7 +14395,7 @@ cleanup (void)
   memset (&ob, '\0', sizeof (ob2));
   die_nontoplevel_freelist = NULL;
   die_collapsed_child_freelist = NULL;
-  pool_destroy ();
+  pool_destroy (NULL);
   first_cu = NULL;
   last_cu = NULL;
   ptr_size = 0;
@@ -15040,10 +14992,26 @@ clear_p2_field (void)
 }
 #endif
 
+/* Helper structure for file state.  */
+struct file_result
+{
+  /* -3: Uninitialized.
+     -2: Already processed under different name.
+     -1: Ignore.
+      0: Processed, changed.
+      1: Processed, unchanged.  */
+  int res;
+  int ret;
+  size_t hardlink_to;
+  unsigned int die_count;
+  bool skip_multifile;
+  bool low_mem_p;
+};
+
 /* Collect potentially shareable DIEs, strings and .debug_macro
    opcode sequences into temporary .debug_* files.  */
 static int
-write_multifile (DSO *dso)
+write_multifile_1 (DSO *dso, struct file_result *res)
 {
   dw_cu_ref cu;
   bool any_cus = false;
@@ -15059,18 +15027,50 @@ write_multifile (DSO *dso)
   if (multi_ehdr.e_ident[0] == '\0')
     multi_ehdr = dso->ehdr;
 
-  if ((multi_ptr_size && ptr_size != multi_ptr_size)
-      || (multi_endian
-	  && multi_endian != (do_read_32 == buf_read_ule32
-			      ? ELFDATA2LSB : ELFDATA2MSB)))
+  if (multifile_force_ptr_size && ptr_size != multifile_force_ptr_size)
+    {
+      error (0, 0, "File %s skipped for multi-file optimization, different"
+	     " pointer size", dso->filename);
+      res->skip_multifile = true;
+      return 1;
+    }
+  else if (multi_ptr_size == 0)
+    multi_ptr_size = ptr_size;
+  else if (ptr_size != multi_ptr_size)
     {
       error (0, 0, "Multi-file optimization not allowed for different"
-		   " pointer sizes or endianity");
+	     " pointer sizes");
       multifile = NULL;
       return 1;
     }
-  multi_ptr_size = ptr_size;
-  multi_endian = do_read_32 == buf_read_ule32 ? ELFDATA2LSB : ELFDATA2MSB;
+  else
+    {
+      /* Same ptr_size.  */
+    }
+
+  int endianity = (do_read_32 == buf_read_ule32
+		   ? ELFDATA2LSB
+		   : ELFDATA2MSB);
+  if (multifile_force_endian && endianity != multifile_force_endian)
+    {
+      error (0, 0, "File %s skipped for multi-file optimization, different"
+	     " endianity", dso->filename);
+      res->skip_multifile = true;
+      return 1;
+    }
+  else if (multi_endian == 0)
+    multi_endian = endianity;
+  else if (multi_endian != endianity)
+    {
+      error (0, 0, "Multi-file optimization not allowed for different"
+	     " endianity");
+      multifile = NULL;
+      return 1;
+    }
+  else
+    {
+      /* Same endianity.  */
+    }
 
 #if DEVEL
   clear_p2_field ();
@@ -15096,10 +15096,15 @@ write_multifile (DSO *dso)
       dw_cu_ref *cup;
 
       for (cup = &first_cu; *cup && (*cup)->cu_kind != CU_TYPES; )
-	if ((*cup)->cu_die->die_no_multifile == 0)
-	  cup = &(*cup)->cu_next;
-	else
-	  *cup = (*cup)->cu_next;
+	{
+	  if ((*cup)->cu_new_abbrev)
+	    htab_delete ((*cup)->cu_new_abbrev);
+
+	  if ((*cup)->cu_die->die_no_multifile == 0)
+	    cup = &(*cup)->cu_next;
+	  else
+	    *cup = (*cup)->cu_next;
+	}
       *cup = NULL;
       multifile_mode = MULTIFILE_MODE_WR;
       if (tracing)
@@ -15174,6 +15179,64 @@ write_multifile (DSO *dso)
       debug_sections[i].new_size = saved_new_size[i];
       saved_new_data[i] = NULL;
     }
+  return ret;
+}
+
+struct pipe
+{
+  int readfd;
+  int writefd;
+};
+
+static bool write_multifile_parallel_p;
+static int child_id;
+static struct pipe *pipes;
+
+/* Get token.  */
+static void
+get_token (void)
+{
+  int n = child_id;
+  int readfd = pipes[n].readfd;
+  int writefd = pipes[n].writefd;
+  close (writefd);
+  char buf;
+  read (readfd, &buf, 1);
+  close (readfd);
+}
+
+/* Pass token to child N.  */
+static void
+pass_token (int n)
+{
+  int readfd = pipes[n].readfd;
+  int writefd = pipes[n].writefd;
+  close (readfd);
+  char buf = '\0';
+  write (writefd, &buf, 1);
+  close (writefd);
+}
+
+/* Wrapper around write_multifile_1 that ensures write_multifile_1 is called
+   in file order.  */
+static int
+write_multifile (DSO *dso, struct file_result *res)
+{
+  int ret;
+
+  if (write_multifile_parallel_p)
+    {
+      get_token ();
+
+      multi_info_off = lseek (multi_info_fd, 0L, SEEK_END);
+      multi_abbrev_off = lseek (multi_abbrev_fd, 0L, SEEK_END);
+      multi_line_off = lseek (multi_line_fd, 0L, SEEK_END);
+      multi_str_off = lseek (multi_str_fd, 0L, SEEK_END);
+      multi_macro_off = lseek (multi_macro_fd, 0L, SEEK_END);
+    }
+
+  ret = write_multifile_1 (dso, res);
+
   return ret;
 }
 
@@ -15252,32 +15315,20 @@ remove_empty_pus (void)
   return 0;
 }
 
-/* Helper structure for hardlink discovery.  */
-struct file_result
-{
-  /* -2: Already processed under different name.
-     -1: Ignore.
-      0: Processed, changed.
-      1: Processed, unchanged.  */
-  int res;
-  dev_t dev;
-  ino_t ino;
-  nlink_t nlink;
-  unsigned int die_count;
-};
-
 /* Handle compression of a single file FILE.  If OUTFILE is
    non-NULL, the result will be stored into that file, otherwise
    the result will be written into a temporary file that is renamed
    over FILE.  */
 static int
-dwz (const char *file, const char *outfile, struct file_result *res,
-     struct file_result *resa, char **files)
+dwz (const char *file, const char *outfile, struct file_result *res)
 {
   DSO *dso;
   int ret = 0, fd;
   unsigned int i;
   struct stat st;
+
+  if (res->res == -1)
+    return 1;
 
   res->res = -1;
   fd = open (file, O_RDONLY);
@@ -15294,64 +15345,6 @@ dwz (const char *file, const char *outfile, struct file_result *res,
     }
 
   res->res = 1;
-  res->dev = st.st_dev;
-  res->ino = st.st_ino;
-  res->nlink = st.st_nlink;
-  /* Hardlink handling if requested.  */
-  if (resa != NULL)
-    {
-      size_t n;
-      for (n = 0; &resa[n] != res; n++)
-	if (resa[n].res >= 0
-	    && resa[n].nlink > 1
-	    && resa[n].dev == st.st_dev
-	    && resa[n].ino == st.st_ino)
-	  break;
-      if (&resa[n] != res)
-	{
-	  /* If a hardlink to this has been processed before
-	     and we didn't change it, just assume the same
-	     state.  */
-	  if (resa[n].res == 1)
-	    {
-	      if (tracing)
-		fprintf (stderr, "Skipping hardlink %s to unchanged file\n",
-			 file);
-	      close (fd);
-	      res->res = -2;
-	      return 0;
-	    }
-	  /* If it changed, try to hardlink it again.  */
-	  if (resa[n].res == 0)
-	    {
-	      size_t len = strlen (file);
-	      char *filename = alloca (len + sizeof (".#dwz#.XXXXXX"));
-	      int fd2;
-	      if (tracing)
-		fprintf (stderr, "Updating hardlink %s to changed file\n",
-			 file);
-	      memcpy (filename, file, len);
-	      memcpy (filename + len, ".#dwz#.XXXXXX",
-		      sizeof (".#dwz#.XXXXXX"));
-	      fd2 = mkstemp (filename);
-	      if (fd2 >= 0)
-		{
-		  close (fd2);
-		  unlink (filename);
-		  if (link (files[n], filename) == 0)
-		    {
-		      if (rename (filename, file) == 0)
-			{
-			  close (fd);
-			  res->res = -2;
-			  return 0;
-			}
-		      unlink (filename);
-		    }
-		}
-	    }
-	}
-    }
 
   if (tracing)
     {
@@ -15430,7 +15423,7 @@ dwz (const char *file, const char *outfile, struct file_result *res,
 				    + debug_sections[DEBUG_TYPES].new_size));
 
 	  if (multifile && !fi_multifile && !low_mem)
-	    write_multifile (dso);
+	    write_multifile (dso, res);
 
 	  cleanup ();
 	  if (outfile != NULL)
@@ -15569,7 +15562,7 @@ dwz (const char *file, const char *outfile, struct file_result *res,
 	  debug_sections[DEBUG_GNU_PUBTYPES].new_size = 0;
 
 	  if (multifile && !fi_multifile && !low_mem)
-	    write_multifile (dso);
+	    write_multifile (dso, res);
 
 	  bool save_to_temp = save_temps && multifile && multifile_mode == 0;
 	  cleanup ();
@@ -15631,15 +15624,17 @@ optimize_multifile (unsigned int *die_count)
   Elf_Scn *scn;
   Elf_Data *data;
   char *e_ident;
-  const char shstrtab_gnu[]
+  static const char shstrtab_gnu[]
     = "\0.shstrtab\0.note.gnu.build-id\0.gdb_index\0"
       ".debug_info\0.debug_abbrev\0.debug_line\0.debug_str\0.debug_macro";
-  const char shstrtab_dwarf5[]
+  static const char shstrtab_dwarf5[]
     = "\0.shstrtab\0.gdb_index\0"
       ".debug_info\0.debug_abbrev\0.debug_line\0.debug_str\0.debug_macro\0"
       ".debug_sup";
-  const char *shstrtab;
-  size_t shstrtab_len;
+  const char *const shstrtab = dwarf_5 ? shstrtab_dwarf5 : shstrtab_gnu;
+  const size_t shstrtab_len = (dwarf_5
+			       ? sizeof shstrtab_dwarf5
+			       : sizeof shstrtab_gnu);
   const char *p;
   unsigned char note[0x24], *np, *supp;
   struct sha1_ctx ctx;
@@ -15665,16 +15660,6 @@ optimize_multifile (unsigned int *die_count)
       fprintf (stderr, "optimize_multifile\n");
     }
 
-  if (dwarf_5)
-    {
-      shstrtab = shstrtab_dwarf5;
-      shstrtab_len = sizeof shstrtab_dwarf5;
-    }
-  else
-    {
-      shstrtab = shstrtab_gnu;
-      shstrtab_len = sizeof shstrtab_gnu;
-    }
   debug_sections[DEBUG_INFO].size = multi_info_off;
   debug_sections[DEBUG_INFO].data
     = (multi_info_off
@@ -15798,7 +15783,7 @@ optimize_multifile (unsigned int *die_count)
 	  hashval_t hash;
 
 	  q = (unsigned char *) strchr ((char *) p, '\0');
-	  hash = iterative_hash (p, q - p, 0);
+	  hash = hash (p, q - p);
 	  se.off = p - debug_sections[DEBUG_STR].data;
 	  se.new_off = hash & ~1U;
 	  slot = htab_find_slot_with_hash (strp_htab, &se, se.new_off, INSERT);
@@ -16118,8 +16103,7 @@ read_multifile (int fd, unsigned int die_count)
 	    {
 	      q = (unsigned char *) strchr ((char *) p, '\0') + 1;
 	      slot = htab_find_slot_with_hash (strp_htab, p,
-					       iterative_hash (p, q - p - 1,
-							       0), INSERT);
+					       hash (p, q - p - 1), INSERT);
 	      if (slot == NULL)
 		dwz_oom ();
 	      assert (*slot == NULL);
@@ -16132,8 +16116,7 @@ read_multifile (int fd, unsigned int die_count)
 		  p = debug_sections[DEBUG_STR].data + *pi;
 		  q = (unsigned char *) strchr ((char *) p, '\0');
 		  slot = htab_find_slot_with_hash (strp_htab, p,
-						   iterative_hash (p, q - p,
-								   0), INSERT);
+						   hash (p, q - p), INSERT);
 		  if (slot == NULL)
 		    dwz_oom ();
 		  assert (*slot == NULL);
@@ -16157,10 +16140,7 @@ read_multifile (int fd, unsigned int die_count)
       alt_macro_htab = macro_htab;
       macro_htab = NULL;
       alt_first_cu = first_cu;
-      alt_pool = pool;
-      pool = NULL;
-      pool_next = NULL;
-      pool_limit = NULL;
+      alt_pool = finalize_pool ();
       alt_ob = ob;
       alt_ob2 = ob2;
       memset (&ob, '\0', sizeof (ob));
@@ -16261,618 +16241,628 @@ make_temp_file (const char *name)
   return fd;
 }
 
-int die_count_method_parsed;
-int deduplication_mode_parsed;
-
-/* Options for getopt_long.  */
-static struct option dwz_options[] =
+/* As dwz, but retry with MULTIFILE_MODE_LOW_MEM if the low_mem_die_limit
+   is hit.  */
+static int
+dwz_with_low_mem (const char *file, const char *outfile,
+		  struct file_result *res)
 {
-  { "help",		 no_argument,	    0, '?' },
-  { "output",		 required_argument, 0, 'o' },
-  { "multifile",	 required_argument, 0, 'm' },
-  { "quiet",		 no_argument,	    0, 'q' },
-  { "hardlink",		 no_argument,	    0, 'h' },
-  { "low-mem-die-limit", required_argument, 0, 'l' },
-  { "max-die-limit",	 required_argument, 0, 'L' },
-  { "multifile-name",	 required_argument, 0, 'M' },
-  { "relative",		 no_argument,	    0, 'r' },
-  { "version",		 no_argument,	    0, 'v' },
-  { "import-optimize",
-			 no_argument,	    &import_opt_p, 1 },
-  { "no-import-optimize",
-			 no_argument,	    &import_opt_p, 0 },
-  { "dwarf-5",		 no_argument,	    0, '5' },
-#if DEVEL
-  { "devel-trace",	 no_argument,	    &tracing, 1 },
-  { "devel-progress",	 no_argument,	    &progress_p, 1 },
-  { "devel-ignore-size", no_argument,	    &ignore_size, 1 },
-  { "devel-ignore-locus",no_argument,	    &ignore_locus, 1 },
-  { "devel-force",	 no_argument,	    &force_p, 1 },
-  { "devel-save-temps",  no_argument,	    &save_temps, 1 },
-  { "devel-dump-checksum",
-			 no_argument,	    &dump_checksum_p, 1 },
-  { "devel-dump-dies",  no_argument,	    &dump_dies_p, 1 },
-  { "devel-dump-dups",  no_argument,	    &dump_dups_p, 1 },
-  { "devel-dump-pus",  no_argument,	    &dump_pus_p, 1 },
-  { "devel-unoptimized-multifile",
-			 no_argument,	    &unoptimized_multifile, 1 },
-  { "devel-verify-edges",no_argument,	    &verify_edges_p, 1 },
-  { "devel-verify-dups", no_argument,	    &verify_dups_p, 1 },
-  { "devel-dump-edges",  no_argument,	    &dump_edges_p, 1 },
-  { "devel-partition-dups-opt",
-			 no_argument,	    &partition_dups_opt, 1 },
-  { "devel-die-count-method",
-			 required_argument, &die_count_method_parsed, 1 },
-  { "devel-stats",	 no_argument,	    &stats_p, 1 },
-  { "devel-deduplication-mode",
-			 required_argument, &deduplication_mode_parsed, 1 },
-  { "devel-uni-lang",
-			 no_argument,	    &uni_lang_p, 1 },
-  { "devel-no-uni-lang",
-			 no_argument,	    &uni_lang_p, 0 },
-  { "devel-gen-cu",
-			 no_argument,	    &gen_cu_p, 1 },
-  { "devel-no-gen-cu",
-			 no_argument,	    &gen_cu_p, 0 },
-#endif
-  { "odr",		 no_argument,	    &odr, 1 },
-  { "no-odr",		 no_argument,	    &odr, 0 },
-  { "odr-mode",		 required_argument, &odr_mode_parsed, 1 },
-  { NULL,		 no_argument,	    0, 0 }
-};
+  int ret;
 
-/* Struct describing various usage aspects of a command line option.  */
-struct option_help
-{
-  const char *short_name;
-  const char *long_name;
-  const char *argument;
-  const char *default_value;
-  const char *msg;
-};
+  res->low_mem_p = false;
 
-/* Describe common command line options.  */
-static struct option_help dwz_common_options_help[] =
-{
-  { "q", "quiet", NULL, NULL,
-    "Silence up the most common messages." },
-  { "l", "low-mem-die-limit", "<COUNT|none>", "10 million DIEs",
-    "Handle files larger than this limit using a slower and more memory"
-    " usage friendly mode and don't optimize those files in multifile mode." },
-  { "L", "max-die-limit", "<COUNT|none>", "50 million DIEs",
-    "Don't optimize files larger than this limit." },
-  { NULL, "odr", NULL, NULL,
-    NULL },
-  { NULL, "no-odr", NULL, "Disabled",
-    "Enable/disable one definition rule optimization." },
-  { NULL, "odr-mode", "<basic|link>", "link",
-    "Set aggressiveness level of one definition rule optimization." },
-  { NULL, "import-optimize", NULL, NULL,
-    NULL },
-  { NULL, "no-import-optimize", NULL, "Enabled",
-    "Enable/disable optimization that reduces the number of"
-    " DW_TAG_imported_unit DIEs." }
-};
+  ret = (low_mem_die_limit == 0
+	 ? 2
+	 : dwz (file, outfile, res));
 
-/* Describe single-file command line options.  */
-static struct option_help dwz_single_file_options_help[] =
-{
-  { "o", "output", "OUTFILE", NULL,
-    "Place the output in OUTFILE." }
-};
+  if (ret == 2)
+    {
+      multifile_mode = MULTIFILE_MODE_LOW_MEM;
+      res->low_mem_p = true;
 
-/* Describe mult-file command line options.  */
-static struct option_help dwz_multi_file_options_help[] =
-{
-  { "h", "hardlink", NULL, NULL,
-    "Handle hardlinked files as one file." },
-  { "m", "multifile", "COMMONFILE", NULL,
-    "Enable multifile optimization, placing common DIEs in multifile"
-    " COMMONFILE." },
-  { "M", "multifile-name", "NAME", NULL,
-    "Set .gnu_debugaltlink or .debug_sup in files to NAME." },
-  { "r", "relative", NULL, NULL,
-    "Set .gnu_debugaltlink in files to relative path from file directory"
-    " to multifile." },
-  { "5", "dwarf-5", NULL, NULL,
-    "Emit DWARF 5 standardized supplementary object files instead of"
-    " GNU extension .debug_altlink." }
-};
+      ret = dwz (file, outfile, res);
+    }
 
-/* Describe misc command line options.  */
-static struct option_help dwz_misc_options_help[] =
-{
-  { "v", "version", NULL, NULL,
-    "Display dwz version information." },
-  { "?", "help", NULL, NULL,
-    "Display this information." }
-};
-
-/* Print LEN spaces to STREAM.  */
-static void
-do_indent (FILE *stream, unsigned int len)
-{
-  unsigned int i;
-
-  for (i = 0; i < len; i++)
-    fprintf (stream, " ");
+  return ret;
 }
 
-/* Print MSG to STREAM, indenting to INDENT and wrapping at LIMIT.
-   Assume starting position is at INDENT.  */
+/* Initialize struct file_result RES.  */
 static void
-wrap (FILE *stream, unsigned int indent, unsigned int limit, const char *msg)
+init_file_result (struct file_result *res)
 {
-  unsigned int len = indent;
-  const char *s = msg;
-  while (true)
+  res->die_count = 0;
+  res->res = -3;
+  res->skip_multifile = false;
+  res->low_mem_p = false;
+}
+
+/* Dwarf-compress FILE.  If OUTFILE, write to result to OUTFILE, otherwise
+   modify FILE.  */
+static int
+dwz_one_file (const char *file, const char *outfile)
+{
+  struct file_result res;
+
+  if (stats_p)
+    init_stats (file);
+
+  init_file_result (&res);
+
+  return dwz_with_low_mem (file, outfile, &res);
+}
+
+/* Helper structure for hardlink discovery.  */
+struct hl_stat
+{
+  dev_t dev;
+  ino_t ino;
+  nlink_t nlink;
+};
+
+/* Detect which FILES are hardlinks, and mark those in RESA.  */
+static bool
+detect_hardlinks (int nr_files, char *files[], struct file_result *resa)
+{
+  bool found = false;
+  struct hl_stat hl_stat[nr_files];
+  int i;
+
+  /* Try to open all files.  */
+  for (i = 0; i < nr_files; i++)
     {
-      const char *e = strchr (s, ' ');
-      unsigned int word_len;
-      if (e == NULL)
-	word_len = strlen (s);
+      struct file_result *res = &resa[i];
+      int fd;
+      struct stat st;
+
+      const char *file = files[i];
+      res->res = -1;
+
+      fd = open (file, O_RDONLY);
+      if (fd < 0)
+	error (0, errno, "Failed to open input file %s", file);
+      else if (fstat (fd, &st) < 0)
+	error (0, errno, "Failed to stat input file %s", file);
       else
-	word_len = e - s;
-      if (word_len == 0)
-	return;
-
-      if (len + 1 /* space */ + word_len > limit)
 	{
-	  fprintf (stream, "\n");
-	  do_indent (stream ,indent);
-	  len = indent;
-	}
-      else if (len > indent)
-	{
-	  fprintf (stream, " ");
-	  len += 1;
+	  res->res = 1;
+	  hl_stat[i].dev = st.st_dev;
+	  hl_stat[i].ino = st.st_ino;
+	  hl_stat[i].nlink = st.st_nlink;
 	}
 
-      if (e != NULL)
+      close (fd);
+    }
+
+  /* Detect hard links.  */
+  for (i = 0; i < nr_files; i++)
+    {
+      struct file_result *res = &resa[i];
+      int n;
+      for (n = 0; n != i; n++)
+	if (resa[n].res >= 0
+	    && hl_stat[n].nlink > 1
+	    && hl_stat[n].dev == hl_stat[i].dev
+	    && hl_stat[n].ino == hl_stat[i].ino)
+	  break;
+      if (n == i)
+	continue;
+      res->res = -2;
+      res->hardlink_to = n;
+      found = true;
+    }
+
+  return found;
+}
+
+/* Update the FILES marked as hardlink in RESA.  */
+static void
+update_hardlinks (int nr_files, char *files[], struct file_result *resa)
+{
+  int i;
+
+  /* Update hardlinks.  */
+  for (i = 0; i < nr_files; i++)
+    {
+      struct file_result *res = &resa[i];
+      const char *file = files[i];
+      size_t n;
+      if (res->res != -2)
+	continue;
+      n = res->hardlink_to;
+
+      /* If a hardlink to this has been processed before
+	 and we didn't change it, just assume the same
+	 state.  */
+      if (resa[n].res == 1)
 	{
-	  const char *i;
-	  for (i = s; i < e; ++i)
-	    fprintf (stream, "%c", *i);
+	  if (tracing)
+	    fprintf (stderr, "Skipping hardlink %s to unchanged file\n",
+		     file);
+	  continue;
 	}
-      else
-	fprintf (stream, "%s", s);
-      len += word_len;
 
-      if (e == NULL)
-	break;
-
-      s = e + 1;
+      /* If it changed, try to hardlink it again.  */
+      if (resa[n].res == 0)
+	{
+	  size_t len = strlen (file);
+	  char *filename = alloca (len + sizeof (".#dwz#.XXXXXX"));
+	  int fd2;
+	  if (tracing)
+	    fprintf (stderr, "Updating hardlink %s to changed file\n",
+		     file);
+	  memcpy (filename, file, len);
+	  memcpy (filename + len, ".#dwz#.XXXXXX",
+		  sizeof (".#dwz#.XXXXXX"));
+	  fd2 = mkstemp (filename);
+	  if (fd2 >= 0)
+	    {
+	      close (fd2);
+	      unlink (filename);
+	      if (link (files[n], filename) == 0)
+		{
+		  if (rename (filename, file) == 0)
+		    ;
+		  else
+		    unlink (filename);
+		}
+	    }
+	}
     }
 }
 
-/* Print OPTIONS_HELP of length H to STREAM, indenting to help message to
-   INDENT an wrapping at LIMIT.  */
-static void
-print_options_help (FILE *stream, struct option_help *options_help, unsigned int n,
-		    unsigned int indent, unsigned int limit)
+/* Encode child process exit status.  */
+static int
+encode_child_exit_status (int thisret, struct file_result *res)
 {
-  unsigned len;
-  const char *s;
-  unsigned int i;
+  assert (thisret == 0 ||  thisret == 1);
+  if (thisret == 0 && res->low_mem_p)
+    thisret = 2;
+  assert (res->res >= -3 && res->res <= 1);
+  return (thisret
+	  + ((res->res + 3) << 2)
+	  + ((res->skip_multifile ? 1 : 0) << 5));
+}
 
-  for (i = 0; i <  n; ++i)
+/* Decode child process exit status.  */
+static int
+decode_child_exit_status (int state, struct file_result *res)
+{
+  int ret;
+  if (!WIFEXITED (state))
+    error (1, 0, "Child dwz process got killed");
+  int status = WEXITSTATUS (state);
+  ret = status & 0x3;
+  status >>= 2;
+
+  res->low_mem_p = false;
+  if (ret == 2)
     {
-      len = 0;
+      ret = 0;
+      res->low_mem_p = true;
+    }
 
-      fprintf (stream, "  ");
-      len += 2;
+  res->res = (int)(status & 0x7) - 3;
+  status >>= 3;
 
-      s = options_help[i].short_name;
-      if (s)
+  res->skip_multifile = (status & 0x1) ? true : false;
+
+  return ret;
+}
+
+/* Wait on child exit with PID, update PIDS and RES.  */
+static void
+wait_child_exit (pid_t pid, pid_t *pids, int nr_pids,
+		 struct file_result *resa)
+{
+  int state;
+  pid_t got_pid = waitpid (pid, &state, 0);
+
+  int i;
+  for (i = 0; i < nr_pids; ++i)
+    if (pids[i] == got_pid)
+      {
+	pids[i] = 0;
+	break;
+      }
+  assert (i < nr_pids);
+
+  resa[i].ret = decode_child_exit_status (state, &resa[i]);
+}
+
+static int *workset;
+static int workset_size = 0;
+int current_multifile_owner = -1;
+int current_multifile_owner_file_idx = -1;
+
+/* Wait on exit of chilren in PIDS, update RESA.  */
+static void
+wait_children_exit (pid_t *pids, int nr_files, struct file_result *resa)
+{
+  int i;
+  for (i = 0; i < nr_files; i++)
+    {
+      struct file_result *res = &resa[i];
+      if (pids[i] == 0)
+	continue;
+      wait_child_exit (pids[i], &pids[i], 1, res);
+      if (current_multifile_owner_file_idx == -1
+	  || i < current_multifile_owner_file_idx)
+	continue;
+      assert (i == current_multifile_owner_file_idx);
+      current_multifile_owner++;
+      if (current_multifile_owner == workset_size)
+	continue;
+      current_multifile_owner_file_idx
+	= workset[current_multifile_owner];
+      pass_token (current_multifile_owner);
+    }
+}
+
+/* Dwarf-compress FILES.  If HARDLINK, detect if some files are hardlinks and
+   if so, dwarf-compress just one, and relink the others.  */
+static int
+dwz_files_1 (int nr_files, char *files[], bool hardlink,
+	     struct file_result *resa)
+{
+  int ret = 0;
+  int i, j;
+  const char *file;
+  int successcount = 0;
+
+  for (i = 0; i < nr_files; ++i)
+    init_file_result (&resa[i]);
+
+  if (multifile)
+    {
+      if (multifile_force_ptr_size)
+	multi_ptr_size = multifile_force_ptr_size;
+      if (multifile_force_endian)
+	multi_endian = multifile_force_endian;
+
+      multi_info_fd = make_temp_file ("dwz.debug_info");
+      multi_abbrev_fd = make_temp_file ("dwz.debug_abbrev");
+      multi_line_fd = make_temp_file ("dwz.debug_line");
+      multi_str_fd = make_temp_file ("dwz.debug_str");
+      multi_macro_fd = make_temp_file ("dwz.debug_macro");
+      if (multi_info_fd == -1
+	  || multi_abbrev_fd == -1
+	  || multi_line_fd == -1
+	  || multi_str_fd == -1
+	  || multi_macro_fd == -1)
 	{
-	  fprintf (stream, "-%s", s);
-	  len += 2;
+	  error (0, 0, "Could not create multifile temporary files");
+	  multifile = NULL;
 	}
+    }
 
-      s = options_help[i].long_name;
-      if (len == 4)
-	{
-	  fprintf (stream, ", ");
-	  len += 2;
-	}
-      fprintf (stream, "--%s", s);
-      len += 2 + strlen (s);
+  if (hardlink)
+    hardlink = detect_hardlinks (nr_files, files, resa);
 
-      s = options_help[i].argument;
-      if (s)
-	{
-	  fprintf (stream, " %s", s);
-	  len += 1 + strlen (s);
-	}
+  workset = malloc (nr_files * sizeof (int));
+  if (workset == NULL)
+    error (1, ENOMEM, "failed to allocate workset array");
+  for (i = 0; i < nr_files; i++)
+    {
+      struct file_result *res = &resa[i];
+      if (res->res == -2)
+	/* Skip hard links.  */
+	continue;
+      workset[workset_size] = i;
+      workset_size++;
+    }
 
-      s = options_help[i].msg;
-      if (s)
+  bool initial_parallel_p = max_forks > 1;
+  if (initial_parallel_p && multifile)
+    {
+     if (multifile_force_ptr_size != 0 && multifile_force_endian != 0)
+       {
+	 write_multifile_parallel_p = true;
+	 pipes = malloc (workset_size * 2 * sizeof (int));
+	 if (pipes == NULL)
+	   error (1, ENOMEM, "failed to allocate pipes array");
+	 for (i = 0; i < workset_size; i++)
+	   {
+	     int fds[2];
+	     if (pipe (fds) != 0)
+	       error (1, ENOMEM, "failed to initialize pipe");
+	     pipes[i].readfd = fds[0];
+	     pipes[i].writefd = fds[1];
+	   }
+       }
+     else
+       initial_parallel_p = false;
+    }
+  if (initial_parallel_p)
+    {
+      pid_t pids[nr_files];
+      int nr_forks = 0;
+      for (i = 0; i < nr_files; i++)
+	pids[i] = 0;
+      for (j = 0; j < workset_size; j++)
 	{
-	  if (len > indent)
+	  int i = workset[j];
+
+	  if (nr_forks == max_forks)
 	    {
-	      fprintf (stream, "\n");
-	      do_indent (stream, indent);
+	      if (multifile == NULL)
+		wait_child_exit (-1, pids, i, resa);
+	      else
+		{
+		  int k = current_multifile_owner_file_idx;
+		  wait_child_exit (pids[k], &pids[k], 1, &resa[k]);
+		  current_multifile_owner++;
+		  current_multifile_owner_file_idx
+		    = workset[current_multifile_owner];
+		  pass_token (current_multifile_owner);
+		}
+	      nr_forks--;
+	    }
+
+	  pid_t fork_res = fork ();
+	  assert (fork_res != -1);
+	  if (fork_res == 0)
+	    {
+	      child_id = j;
+	      file = files[i];
+	      struct file_result *res = &resa[i];
+	      int thisret = dwz_with_low_mem (file, NULL, res);
+	      return encode_child_exit_status (thisret, res);
 	    }
 	  else
-	    do_indent (stream, indent - len);
-	  len = indent;
-
-	  wrap (stream, indent, limit, s);
+	    {
+	      if (multifile && j == 0)
+		{
+		  current_multifile_owner = j;
+		  current_multifile_owner_file_idx
+		    = workset[current_multifile_owner];
+		  pass_token (current_multifile_owner);
+		}
+	      pids[i] = fork_res;
+	      nr_forks++;
+	    }
 	}
-      fprintf (stream, "\n");
-
-      s = options_help[i].default_value;
-      if (s)
+      if (nr_forks > 0)
+	wait_children_exit (pids, nr_files, resa);
+    }
+  else
+    {
+      for (j = 0; j < workset_size; j++)
 	{
-	  do_indent (stream, indent);
-	  fprintf (stream, "Default value: %s.\n", s);
+	  int i = workset[j];
+	  file = files[i];
+	  struct file_result *res = &resa[i];
+	  if (stats_p)
+	    init_stats (file);
+	  res->ret = dwz_with_low_mem (file, NULL, res);
 	}
     }
+
+  for (j = 0; j < workset_size; j++)
+    {
+      int i = workset[j];
+      struct file_result *res = &resa[i];
+      int thisret = res->ret;
+      if (thisret == 1)
+	ret = 1;
+      else if (!res->low_mem_p && !res->skip_multifile && res->res >= 0)
+	successcount++;
+    }
+
+  if (hardlink)
+    update_hardlinks (nr_files, files, resa);
+
+  if (multifile == NULL)
+    return ret;
+
+  if (successcount < 2)
+    {
+      error (0, 0, "Too few files for multifile optimization");
+      return ret;
+    }
+
+  if (write_multifile_parallel_p)
+    {
+      multi_info_off = lseek (multi_info_fd, 0L, SEEK_END);
+      multi_abbrev_off = lseek (multi_abbrev_fd, 0L, SEEK_END);
+      multi_line_off = lseek (multi_line_fd, 0L, SEEK_END);
+      multi_str_off = lseek (multi_str_fd, 0L, SEEK_END);
+      multi_macro_off = lseek (multi_macro_fd, 0L, SEEK_END);
+    }
+  if (multi_info_off == 0 && multi_str_off == 0 && multi_macro_off == 0)
+    {
+      if (!quiet)
+	error (0, 0, "No suitable DWARF found for multifile optimization");
+      return ret;
+    }
+
+  if (write_multifile_parallel_p)
+    {
+      /* We reproduce here what happens when we run sequentially.  This is a
+	 kludge that probably needs to be replaced by IPC.  */
+      for (i = 0; i < nr_files; i++)
+	{
+	  struct file_result *res = &resa[i];
+	  if (!res->low_mem_p && !res->skip_multifile && res->res >= 0)
+	    {
+	      int fd = open (files[i], O_RDONLY);
+	      if (fd < 0)
+		return ret;
+	      DSO *dso = fdopen_dso (fd, files[i]);
+	      if (dso == NULL)
+		{
+		  close (fd);
+		  return ret;
+		}
+	      assert (multi_ehdr.e_ident[0] == '\0');
+	      multi_ehdr = dso->ehdr;
+	      break;
+	    }
+	}
+    }
+
+  unsigned int multifile_die_count = 0;
+  int multi_fd = optimize_multifile (&multifile_die_count);
+  DSO *dso;
+  if (multi_fd == -1)
+    return 1;
+
+  dso = read_multifile (multi_fd, multifile_die_count);
+  if (dso == NULL)
+    {
+      ret = 1;
+      goto cleanup;
+    }
+
+  workset_size = 0;
+  for (i = 0; i < nr_files; i++)
+    {
+      struct file_result *res = &resa[i];
+      /* Don't process again files that couldn't
+	 be processed successfully.  Also skip hard links.  */
+      if (res->res == -1 || res->res == -2
+	  || res->skip_multifile)
+	continue;
+      workset[workset_size] = i;
+      workset_size++;
+    }
+
+  bool finalize_multifile_parallel_p = max_forks > 1;
+  if (finalize_multifile_parallel_p)
+    {
+      pid_t pids[nr_files];
+      int nr_forks = 0;
+      for (i = 0; i < nr_files; i++)
+	pids[i] = 0;
+      for (j = 0; j < workset_size; j++)
+	{
+	  int i = workset[j];
+
+	  if (nr_forks == max_forks)
+	    {
+	      wait_child_exit (-1, pids, i, resa);
+	      nr_forks--;
+	    }
+
+	  pid_t fork_res = fork ();
+	  assert (fork_res != -1);
+	  if (fork_res == 0)
+	    {
+	      file = files[i];
+	      struct file_result *res = &resa[i];
+	      multifile_mode = MULTIFILE_MODE_FI;
+	      int thisret = dwz (file, NULL, res);
+	      return encode_child_exit_status (thisret, res);
+	    }
+	  else
+	    {
+	      pids[i] = fork_res;
+	      nr_forks++;
+	    }
+	}
+      if (nr_forks > 0)
+	wait_children_exit (pids, nr_files, resa);
+    }
+  else
+    {
+      for (j = 0; j < workset_size; j++)
+	{
+	  int i = workset[j];
+	  struct file_result *res = &resa[i];
+	  dw_cu_ref cu;
+	  file = files[i];
+	  if (stats_p)
+	    init_stats (file);
+	  multifile_mode = MULTIFILE_MODE_FI;
+	  for (cu = alt_first_cu; cu; cu = cu->cu_next)
+	    alt_clear_dups (cu->cu_die);
+	  res->ret = dwz (file, NULL, res);
+	}
+    }
+
+  for (j = 0; j < workset_size; j++)
+    {
+      int i = workset[j];
+      struct file_result *res = &resa[i];
+      int thisret = res->ret;
+      ret |= thisret;
+    }
+
+  if (hardlink)
+    update_hardlinks (nr_files, files, resa);
+
+  elf_end (dso->elf);
+  close (multi_fd);
+  free (dso);
+
+ cleanup:
+  cleanup ();
+
+  strp_htab = alt_strp_htab;
+  off_htab = alt_off_htab;
+  dup_htab = alt_dup_htab;
+  macro_htab = alt_macro_htab;
+  ob = alt_ob;
+  ob2 = alt_ob2;
+  cleanup ();
+  pool_destroy (alt_pool);
+
+  return ret;
 }
 
-/* Print usage and exit.  */
-static void
-usage (const char *progname, int failing)
+/* Wrapper around dwz_files_1 that takes care of malloc and free of resa.  */
+static int
+dwz_files (int nr_files, char *files[], bool hardlink)
 {
-  unsigned int n;
-  unsigned int indent, limit;
-  FILE *stream = failing ? stderr : stdout;
+  int ret;
+  struct file_result *resa
+    = (struct file_result *) malloc ((nr_files) * sizeof (*resa));
+  if (resa == NULL)
+    error (1, ENOMEM, "failed to allocate result array");
 
-  fprintf (stream,
-	   ("Usage:\n"
-	    "  %s [common options] [-h] [-m COMMONFILE] [-M NAME | -r] [FILES]\n"
-	    "  %s [common options] -o OUTFILE FILE\n"
-	    "  %s [ -v | -? ]\n"),
-	   progname, progname, progname);
+  ret = dwz_files_1 (nr_files, files, hardlink, resa);
 
-  indent = 30;
-  limit = 80;
-  fprintf (stream, "Common options:\n");
-  n = (sizeof (dwz_common_options_help)
-       / sizeof (dwz_common_options_help[0]));
-  print_options_help (stream, dwz_common_options_help, n, indent, limit);
-
-  fprintf (stream, "Single-file options:\n");
-  n = (sizeof (dwz_single_file_options_help)
-       / sizeof (dwz_single_file_options_help[0]));
-  print_options_help (stream, dwz_single_file_options_help, n, indent, limit);
-
-  fprintf (stream, "Multi-file options:\n");
-  n = (sizeof (dwz_multi_file_options_help)
-       / sizeof (dwz_multi_file_options_help[0]));
-  print_options_help (stream, dwz_multi_file_options_help, n, indent, limit);
-
-  fprintf (stream, "Miscellaneous options:\n");
-  n = (sizeof (dwz_misc_options_help)
-       / sizeof (dwz_misc_options_help[0]));
-  print_options_help (stream, dwz_misc_options_help, n, indent, limit);
-
-#if DEVEL
-  fprintf (stream, "Development options:\n");
-  fprintf (stream, "%s",
-	   ("  --devel-trace\n"
-	    "  --devel-progress\n"
-	    "  --devel-stats\n"
-	    "  --devel-ignore-size\n"
-	    "  --devel-ignore-locus\n"
-	    "  --devel-force\n"
-	    "  --devel-save-temps\n"
-	    "  --devel-dump-checksum\n"
-	    "  --devel-dump-dies\n"
-	    "  --devel-dump-dups\n"
-	    "  --devel-dump-pus\n"
-	    "  --devel-unoptimized-multifile\n"
-	    "  --devel-verify-dups\n"
-	    "  --devel-verify-edges\n"
-	    "  --devel-dump-edges\n"
-	    "  --devel-partition-dups-opt\n"
-	    "  --devel-die-count-method\n"
-	    "  --devel-deduplication-mode={none,intra-cu,inter-cu}\n"
-	    "  --devel-uni-lang / --devel-no-uni-lang\n"
-	    "  --devel-gen-cu / --devel-no-gen-cu\n"));
-#endif
-
-  exit (failing);
-}
-
-/* Print version and exit.  */
-static void
-version (void)
-{
-  printf ("dwz version " DWZ_VERSION "\n"
-	  "Copyright (C) " RH_YEARS " Red Hat, Inc.\n"
-	  "Copyright (C) " FSF_YEARS " Free Software Foundation, Inc.\n"
-	  "Copyright (C) " SUSE_YEARS " SUSE LLC.\n"
-	  "This program is free software; you may redistribute it under the terms of\n"
-	  "the GNU General Public License version 3 or (at your option) any later version.\n"
-	  "This program has absolutely no warranty.\n");
-  exit (0);
+  free (resa);
+  return ret;
 }
 
 int
 main (int argc, char *argv[])
 {
-  const char *outfile = NULL;
-  int ret = 0;
-  int i;
-  unsigned long l;
-  char *end;
-  struct file_result res;
-  bool hardlink = false;
-  const char *file;
+  int ret;
+  const char *outfile;
+  bool hardlink;
+  int nr_files;
+  char **files;
+
+  state = XXH64_createState ();
 
   if (elf_version (EV_CURRENT) == EV_NONE)
     error (1, 0, "library out of date");
 
-  while (1)
+  outfile = NULL;
+  hardlink = false;
+  parse_args (argc, argv, &hardlink, &outfile);
+  nr_files = argc - optind;
+  files = &argv[optind];
+
+  if (nr_files <= 1)
     {
-      int option_index = -1;
-      int c = getopt_long (argc, argv, "m:o:qhl:L:M:r?v5", dwz_options, &option_index);
-      if (c == -1)
-	break;
-      switch (c)
-	{
-	default:
-	case '?':
-	  usage (argv[0], option_index == -1);
-	  break;
+      const char *file = nr_files == 0 ? "a.out" : files[0];
 
-	case 0:
-	  /* Option handled by getopt_long.  */
-	  if (die_count_method_parsed)
-	    {
-	      die_count_method_parsed = 0;
-	      if (strcmp (optarg, "none") == 0)
-		{
-		  die_count_method = none;
-		  break;
-		}
-	      if (strcmp (optarg, "estimate") == 0)
-		{
-		  die_count_method = estimate;
-		  break;
-		}
-	      error (1, 0, "invalid argument --devel-die-count-method %s",
-		     optarg);
-	    }
-	  if (deduplication_mode_parsed)
-	    {
-	      deduplication_mode_parsed = 0;
-	      if (strcmp (optarg, "none") == 0)
-		{
-		  deduplication_mode = dm_none;
-		  break;
-		}
-	      if (strcmp (optarg, "intra-cu") == 0)
-		{
-		  deduplication_mode = dm_intra_cu;
-		  break;
-		}
-	      if (strcmp (optarg, "inter-cu") == 0)
-		{
-		  deduplication_mode = dm_inter_cu;
-		  break;
-		}
-	      error (1, 0, "invalid argument --devel-deduplication-mode %s",
-		     optarg);
-	    }
-	  if (odr_mode_parsed)
-	    {
-	      odr_mode_parsed = 0;
-	      if (strcmp (optarg, "basic") == 0)
-		{
-		  odr_mode = ODR_BASIC;
-		  break;
-		}
-	      if (strcmp (optarg, "link") == 0)
-		{
-		  odr_mode = ODR_LINK;
-		  break;
-		}
-	      error (1, 0, "invalid argument --odr-mode %s",
-		     optarg);
-	    }
-	  break;
-
-	case 'o':
-	  outfile = optarg;
-	  break;
-
-	case 'm':
-	  multifile = optarg;
-	  break;
-
-	case 'q':
-	  quiet = true;
-	  break;
-
-	case 'h':
-	  hardlink = true;
-	  break;
-
-	case 'M':
-	  multifile_name = optarg;
-	  break;
-
-	case 'r':
-	  multifile_relative = true;
-	  break;
-
-	case 'l':
-	  if (strcmp (optarg, "none") == 0)
-	    {
-	      low_mem_die_limit = -1U;
-	      break;
-	    }
-	  l = strtoul (optarg, &end, 0);
-	  if (*end != '\0' || optarg == end || (unsigned int) l != l)
-	    error (1, 0, "invalid argument -l %s", optarg);
-	  low_mem_die_limit = l;
-	  break;
-
-	case 'L':
-	  if (strcmp (optarg, "none") == 0)
-	    {
-	      max_die_limit = -1U;
-	      break;
-	    }
-	  l = strtoul (optarg, &end, 0);
-	  if (*end != '\0' || optarg == end || (unsigned int) l != l)
-	    error (1, 0, "invalid argument -L %s", optarg);
-	  max_die_limit = l;
-	  break;
-
-	case '5':
-	  dwarf_5 = true;
-	  break;
-
-	case 'v':
-	  version ();
-	  break;
-	}
-    }
-
-  /* Specifying a low-mem die-limit that is larger than or equal to the
-     max die-limit has the effect of disabling low-mem mode.  Make this
-     explicit by setting it to the 'none' value.  */
-  if (low_mem_die_limit != -1U
-      && low_mem_die_limit >= max_die_limit)
-    low_mem_die_limit = -1U;
-
-  if (multifile_relative && multifile_name)
-    error (1, 0, "-M and -r options can't be specified together");
-
-  if (optind == argc || optind + 1 == argc)
-    {
-      file = optind == argc ? "a.out" : argv[optind];
       if (multifile != NULL)
 	{
 	  error (0, 0, "Too few files for multifile optimization");
 	  multifile = NULL;
 	}
-      if (stats_p)
-	init_stats (file);
-      res.die_count = 0;
-      ret = (low_mem_die_limit == 0
-	     ? 2
-	     : dwz (file, outfile, &res, NULL, NULL));
-      if (ret == 2)
-	{
-	  multifile_mode = MULTIFILE_MODE_LOW_MEM;
-	  ret = dwz (file, outfile, &res, NULL, NULL);
-	}
+
+      ret = dwz_one_file (file, outfile);
     }
   else
     {
-      int nr_files = argc - optind;
-      struct file_result *resa
-	= (struct file_result *) malloc ((nr_files) * sizeof (*resa));
-      bool hardlinks = false;
-      int successcount = 0;
-
-      for (i = 0; i < nr_files; ++i)
-	resa[i].die_count = 0;
-      if (resa == NULL)
-	error (1, ENOMEM, "failed to allocate result array");
       if (outfile != NULL)
 	error (1, 0, "-o option not allowed for multiple files");
-      if (multifile)
-	{
-	  multi_info_fd = make_temp_file ("dwz.debug_info");
-	  multi_abbrev_fd = make_temp_file ("dwz.debug_abbrev");
-	  multi_line_fd = make_temp_file ("dwz.debug_line");
-	  multi_str_fd = make_temp_file ("dwz.debug_str");
-	  multi_macro_fd = make_temp_file ("dwz.debug_macro");
-	  if (multi_info_fd == -1
-	      || multi_abbrev_fd == -1
-	      || multi_line_fd == -1
-	      || multi_str_fd == -1
-	      || multi_macro_fd == -1)
-	    {
-	      error (0, 0, "Could not create multifile temporary files");
-	      multifile = NULL;
-	    }
-	}
-      for (i = optind; i < argc; i++)
-	{
-	  int thisret;
-	  file = argv[i];
-	  if (stats_p)
-	    init_stats (file);
-	  thisret = (low_mem_die_limit == 0
-		     ? 2
-		     : dwz (file, NULL, &resa[i - optind],
-			    hardlinks ? resa : NULL, &argv[optind]));
-	  if (thisret == 2)
-	    {
-	      multifile_mode = MULTIFILE_MODE_LOW_MEM;
-	      thisret = dwz (file, NULL, &resa[i - optind],
-			     hardlinks ? resa : NULL, &argv[optind]);
-	    }
-	  else if (thisret == 1)
-	    ret = 1;
-	  else if (resa[i - optind].res >= 0)
-	    successcount++;
-	  if (hardlink
-	      && resa[i - optind].res >= 0
-	      && resa[i - optind].nlink > 1)
-	    hardlinks = true;
-	}
-      if (multifile && successcount < 2)
-	{
-	  error (0, 0, "Too few files for multifile optimization");
-	  multifile = NULL;
-	}
-      if (multifile
-	  && multi_info_off == 0 && multi_str_off == 0 && multi_macro_off == 0)
-	{
-	  if (!quiet)
-	    error (0, 0, "No suitable DWARF found for multifile optimization");
-	  multifile = NULL;
-	}
-      if (multifile)
-	{
-	  unsigned int multifile_die_count = 0;
-	  int multi_fd = optimize_multifile (&multifile_die_count);
-	  DSO *dso;
-	  if (multi_fd == -1)
-	    return 1;
-	  dso = read_multifile (multi_fd, multifile_die_count);
-	  if (dso == NULL)
-	    ret = 1;
-	  else
-	    {
-	      for (i = optind; i < argc; i++)
-		{
-		  dw_cu_ref cu;
-		  file = argv[i];
-		  if (stats_p)
-		    init_stats (file);
-		  multifile_mode = MULTIFILE_MODE_FI;
-		  /* Don't process again files that couldn't
-		     be processed successfully.  */
-		  if (resa[i - optind].res == -1)
-		    continue;
-		  for (cu = alt_first_cu; cu; cu = cu->cu_next)
-		    alt_clear_dups (cu->cu_die);
-		  ret |= dwz (file, NULL, &resa[i - optind],
-			      hardlinks ? resa : NULL, &argv[optind]);
-		}
-	      elf_end (dso->elf);
-	      close (multi_fd);
-	      free (dso);
-	    }
-	  cleanup ();
-	  strp_htab = alt_strp_htab;
-	  off_htab = alt_off_htab;
-	  dup_htab = alt_dup_htab;
-	  macro_htab = alt_macro_htab;
-	  pool = alt_pool;
-	  ob = alt_ob;
-	  ob2 = alt_ob2;
-	  cleanup ();
-	}
-      free (resa);
+
+      ret = dwz_files (nr_files, files, hardlink);
     }
 
   if (stats_p)

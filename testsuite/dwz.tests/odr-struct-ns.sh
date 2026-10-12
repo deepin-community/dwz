@@ -21,7 +21,10 @@ for name in member_one member_two member_three member_four; do
 	esac
 done
 
-decl_cnt=$(readelf -wi 1 | grep -c "DW_AT_declaration" || true)
+# Check that bbb and ccc are present as DW_AT_declaration
+readelf -wi 1 | grep -3 DW_AT_declaration > decls
+grep bbb decls >/dev/null
+grep ccc decls >/dev/null
 
 $execs/dwz-for-test --odr 1
 
@@ -38,8 +41,9 @@ for name in member_one member_two member_three member_four; do
 done
 
 # We expect two decls to be removed, for bbb and ccc.
-expected_decl_cnt=$(($decl_cnt - 2))
-decl_cnt=$(readelf -wi 1 | grep -c "DW_AT_declaration" || true)
-[ $expected_decl_cnt -eq $decl_cnt ]
+readelf -wi 1 | grep -3 DW_AT_declaration > decls || true
 
-rm -f 1
+if grep bbb decls >/dev/null ; then exit 1; fi
+if grep ccc decls >/dev/null ; then exit 2; fi
+
+rm -f 1 decls

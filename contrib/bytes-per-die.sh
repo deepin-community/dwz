@@ -3,7 +3,7 @@
 f="$1"
 
 size=$(readelf -WS "$f" \
-	   | egrep "[ \t]\.debug_info" \
+	   | grep -E "[ \t]\.debug_info" \
 	   | sed 's/.*\.debug_info//' \
 	   | awk '{print $4}')
 size=$((16#$size))

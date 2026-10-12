@@ -77,6 +77,16 @@ the executable or shared library to the file named in the argument
 of the \fB-m\fR option.  Either \fB-M\fR or \fB-r\fR
 option can be specified, but not both.
 .TP
+.B \-p N \-\-multifile-pointer-size <N|auto|native>
+Specify the pointer size of the multifile, in bytes.  If auto, use the
+pointer size of the files, provided they match.  If native, use native pointer
+size, as specified in the help message.
+.TP
+.B \-p <l|b|auto> \-\-multifile-endian <l|b|auto|native>
+Specify the endianity of the multifile.  If auto, use the endianity of
+the files, provided they match.  If native, use native endianity, as specified
+in the help message.
+.TP
 .B \-q \-\-quiet
 Silence up some of the most common messages.
 .TP
@@ -110,6 +120,10 @@ argument disables the limit.
 Emit standard DWARF 5 Supplementary Object Files with \fI.debug_sup\fR and
 corresponding forms, instead of the GNU extension \fI.gnu_debugaltlink\fR
 and corresponding forms.
+.TP
+.B \-j <N> \-\-jobs <N>
+Process \fIN\fR files in parallel.  The default is processors / 2.  Disabled
+when multifile is used.
 .TP
 .B \-\-odr / \-\-no-odr
 .B Experimental.

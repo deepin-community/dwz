@@ -52,10 +52,16 @@ echo Bumped version: major: $major,  minor: $minor
 
 version=$major.$minor
 
+set +x
+
 echo $version > VERSION
 
 git add VERSION
 
 git commit -m "Bump version to $version"
 
-git tag dwz-$version
+git push origin master:master
+
+git tag -s -m "dwz $version release" dwz-$version
+
+git push origin dwz-$version

@@ -128,6 +128,8 @@ main ()
     tmp=$(mktemp)
 
     for f in *.c *.h *.def; do
+	if test "$f" = "native.c"; then continue; fi
+
 	if ! grep -q "Copyright (C)" $f; then
 	    echo "error: found file without copyright marker: $f"
 	    exit 1
