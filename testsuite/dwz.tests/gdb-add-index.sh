@@ -1,6 +1,8 @@
 cp $execs/hello 1
 
-gdb-add-index 1
+# Redirect gdb-add-index stderr to stdout.
+# https://sourceware.org/bugzilla/show_bug.cgi?id=29316
+gdb-add-index 1 2>&1
 
 readelf -S 1 | grep -q '\.gdb_index'
 
